@@ -2,6 +2,7 @@ import numpy as np
 from typing import Optional, List
 from abc import ABC, abstractmethod
 import torch
+from .memory_pair import StreamNewtonMemoryPair
 
 
 class OnlineAlgorithm(ABC):
@@ -148,111 +149,71 @@ class OnlineNewtonStep(OnlineAlgorithm):
                 self.weights[pred] -= self.learning_rate * x
 
 
-class MemoryPairOnlineLBFGS(OnlineAlgorithm):
-    """Memory-Pair Online L-BFGS algorithm."""
+class FogoMemoryPair(OnlineAlgorithm):
+    """
+    Fogo Memory Pair wrapper that adapts StreamNewtonMemoryPair to the OnlineAlgorithm interface.
     
-    def __init__(self, n_features: int, n_classes: int, learning_rate: float = 0.001, 
-                 memory_size: int = 5, seed: int = 42):
+    This wrapper converts the classification problem to a regression problem by treating
+    each class as a separate target (one-hot encoding) and using the Fogo memory pair
+    for each class dimension.
+    """
+    
+    def __init__(self, n_features: int, n_classes: int, learning_rate: float = 0.01, 
+                 lam: float = 0.01, eps_total: float = 1.0, delta_total: float = 1e-5,
+                 max_deletions: int = 100, seed: int = 42):
         super().__init__(n_features, n_classes, seed)
         self.learning_rate = learning_rate
-        self.memory_size = memory_size
-        self.weights = np.zeros((n_classes, n_features))  # Initialize to zeros
+        self.lam = lam
         
-        # L-BFGS memory
-        self.s_memory = []  # Step differences
-        self.y_memory = []  # Gradient differences
-        self.rho_memory = []  # 1 / (y^T s)
+        # Set random seed for reproducibility
+        np.random.seed(seed)
         
-        self.prev_grad = None
-        self.prev_weights = None
+        # For multi-class classification, we create one StreamNewtonMemoryPair per class
+        # This effectively treats it as n_classes separate binary classification problems
+        self.memory_pairs = []
+        for i in range(n_classes):
+            memory_pair = StreamNewtonMemoryPair(
+                dim=n_features,
+                lam=lam,
+                eps_total=eps_total,
+                delta_total=delta_total,
+                max_deletions=max_deletions
+            )
+            self.memory_pairs.append(memory_pair)
+        
+        self.weights = np.zeros((n_classes, n_features))
+        self._update_weights()
+    
+    def _update_weights(self):
+        """Update the weights matrix from the memory pairs."""
+        for i, memory_pair in enumerate(self.memory_pairs):
+            self.weights[i] = memory_pair.theta
     
     def predict(self, x: np.ndarray) -> int:
-        """Predict using current weights."""
+        """Make a prediction using the current weights."""
+        # Update weights from memory pairs
+        self._update_weights()
+        
+        # Compute scores for each class
         scores = np.dot(self.weights, x)
         return np.argmax(scores)
     
     def update(self, x: np.ndarray, y: int, loss: float) -> None:
-        """Update weights using Memory-Pair L-BFGS."""
+        """Update the memory pairs with new sample."""
         if loss > 0:  # Only update if we made a mistake
-            # Get current prediction
-            scores = np.dot(self.weights, x)
-            pred = np.argmax(scores)
-            
-            # Calculate current gradient (flattened for L-BFGS)
-            current_grad = np.zeros_like(self.weights)
-            current_grad[y] = -x      # Increase correct class score
-            current_grad[pred] = x    # Decrease predicted class score
-            current_grad_flat = current_grad.flatten()
-            
-            # Store previous state for L-BFGS
-            if self.prev_grad is not None and self.prev_weights is not None:
-                # Calculate s (step) and y (gradient difference)
-                s = self.weights.flatten() - self.prev_weights
-                y_diff = current_grad_flat - self.prev_grad
-                
-                # Calculate rho
-                sy = np.dot(s, y_diff)
-                if abs(sy) > 1e-10:  # Avoid division by zero
-                    rho = 1.0 / sy
-                    
-                    # Update memory
-                    self.s_memory.append(s.copy())
-                    self.y_memory.append(y_diff.copy())
-                    self.rho_memory.append(rho)
-                    
-                    # Keep only recent memory
-                    if len(self.s_memory) > self.memory_size:
-                        self.s_memory.pop(0)
-                        self.y_memory.pop(0)
-                        self.rho_memory.pop(0)
-            
-            # Calculate L-BFGS direction
-            direction_flat = self._calculate_lbfgs_direction(current_grad_flat)
-            direction = direction_flat.reshape(self.weights.shape)
-            
-            # Store current state
-            self.prev_weights = self.weights.flatten().copy()
-            self.prev_grad = current_grad_flat.copy()
+            # One-hot encoding: target is 1 for correct class, 0 for others
+            for i, memory_pair in enumerate(self.memory_pairs):
+                target = 1.0 if i == y else 0.0
+                memory_pair.insert(x, target)
             
             # Update weights
-            self.weights -= self.learning_rate * direction
-    
-    def _calculate_lbfgs_direction(self, grad: np.ndarray) -> np.ndarray:
-        """Calculate L-BFGS search direction."""
-        if not self.s_memory:
-            return grad  # First iteration, use gradient
-        
-        # L-BFGS two-loop recursion
-        q = grad.copy()
-        alphas = []
-        
-        # First loop (backward)
-        for i in range(len(self.s_memory) - 1, -1, -1):
-            alpha = self.rho_memory[i] * np.dot(self.s_memory[i], q)
-            alphas.append(alpha)
-            q -= alpha * self.y_memory[i]
-        
-        # Initial Hessian approximation (scaled identity)
-        if len(self.s_memory) > 0:
-            gamma = np.dot(self.s_memory[-1], self.y_memory[-1]) / np.dot(self.y_memory[-1], self.y_memory[-1])
-            gamma = max(gamma, 1e-8)  # Ensure positive
-            r = gamma * q
-        else:
-            r = q
-        
-        # Second loop (forward)
-        alphas.reverse()
-        for i in range(len(self.s_memory)):
-            beta = self.rho_memory[i] * np.dot(self.y_memory[i], r)
-            r += (alphas[i] - beta) * self.s_memory[i]
-        
-        return r
+            self._update_weights()
 
 
 def get_algorithm(algo_name: str, n_features: int, n_classes: int, seed: int = 42) -> OnlineAlgorithm:
     """Get the appropriate algorithm instance."""
     if algo_name == "memorypair":
-        return MemoryPairOnlineLBFGS(n_features, n_classes, seed=seed)
+        return FogoMemoryPair(n_features, n_classes, seed=seed)
     elif algo_name == "sgd":
         return OnlineSGD(n_features, n_classes, seed=seed)
     elif algo_name == "adagrad":
