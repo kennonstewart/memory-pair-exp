@@ -2,6 +2,7 @@ import numpy as np
 from typing import Optional, List
 from abc import ABC, abstractmethod
 import torch
+from .memory_pair import StreamNewtonMemoryPair
 
 
 class OnlineAlgorithm(ABC):
@@ -249,10 +250,71 @@ class MemoryPairOnlineLBFGS(OnlineAlgorithm):
         return r
 
 
+class FogoMemoryPair(OnlineAlgorithm):
+    """
+    Fogo Memory Pair wrapper that adapts StreamNewtonMemoryPair to the OnlineAlgorithm interface.
+    
+    This wrapper converts the classification problem to a regression problem by treating
+    each class as a separate target (one-hot encoding) and using the Fogo memory pair
+    for each class dimension.
+    """
+    
+    def __init__(self, n_features: int, n_classes: int, learning_rate: float = 0.01, 
+                 lam: float = 0.01, eps_total: float = 1.0, delta_total: float = 1e-5,
+                 max_deletions: int = 100, seed: int = 42):
+        super().__init__(n_features, n_classes, seed)
+        self.learning_rate = learning_rate
+        self.lam = lam
+        
+        # Set random seed for reproducibility
+        np.random.seed(seed)
+        
+        # For multi-class classification, we create one StreamNewtonMemoryPair per class
+        # This effectively treats it as n_classes separate binary classification problems
+        self.memory_pairs = []
+        for i in range(n_classes):
+            memory_pair = StreamNewtonMemoryPair(
+                dim=n_features,
+                lam=lam,
+                eps_total=eps_total,
+                delta_total=delta_total,
+                max_deletions=max_deletions
+            )
+            self.memory_pairs.append(memory_pair)
+        
+        self.weights = np.zeros((n_classes, n_features))
+        self._update_weights()
+    
+    def _update_weights(self):
+        """Update the weights matrix from the memory pairs."""
+        for i, memory_pair in enumerate(self.memory_pairs):
+            self.weights[i] = memory_pair.theta
+    
+    def predict(self, x: np.ndarray) -> int:
+        """Make a prediction using the current weights."""
+        # Update weights from memory pairs
+        self._update_weights()
+        
+        # Compute scores for each class
+        scores = np.dot(self.weights, x)
+        return np.argmax(scores)
+    
+    def update(self, x: np.ndarray, y: int, loss: float) -> None:
+        """Update the memory pairs with new sample."""
+        if loss > 0:  # Only update if we made a mistake
+            # One-hot encoding: target is 1 for correct class, 0 for others
+            for i, memory_pair in enumerate(self.memory_pairs):
+                target = 1.0 if i == y else 0.0
+                memory_pair.insert(x, target)
+            
+            # Update weights
+            self._update_weights()
+
+
 def get_algorithm(algo_name: str, n_features: int, n_classes: int, seed: int = 42) -> OnlineAlgorithm:
     """Get the appropriate algorithm instance."""
     if algo_name == "memorypair":
-        return MemoryPairOnlineLBFGS(n_features, n_classes, seed=seed)
+        return FogoMemoryPair(n_features, n_classes, seed=seed)
     elif algo_name == "sgd":
         return OnlineSGD(n_features, n_classes, seed=seed)
     elif algo_name == "adagrad":
